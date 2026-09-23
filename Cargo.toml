@@ -1,6 +1,6 @@
 [package]
 name = "cargo-auth"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["iadev09"]
 edition = "2024"
 description = "A Cargo subcommand for securely managing and switching between multiple crates.io credentials"
