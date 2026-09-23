@@ -1,0 +1,29 @@
+[package]
+name = "cargo-auth"
+version = "0.1.0"
+authors = ["iadev09"]
+edition = "2024"
+description = "A Cargo subcommand for securely managing and switching between multiple crates.io credentials"
+license = "MIT"
+repository = "https://github.com/iadev09/cargo-auth"
+keywords = ["cargo", "crates-io", "credentials", "authentication", "encryption"]
+categories = [
+    "authentication",
+    "command-line-utilities",
+    "cryptography",
+    "development-tools::cargo-plugins",
+]
+include = ["/src/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-MIT"]
+publish = ["crates-io"]
+
+[dependencies]
+anyhow = "1"
+argon2 = { version = "0.6", features = ["zeroize"] }
+base64 = "0.23"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+clap = { version = "4.6", features = ["derive"] }
+getrandom = "0.4"
+rpassword = "7"
+tempfile = "3"
+toml_edit = "0.23"
+zeroize = { version = "1", features = ["derive"] }
