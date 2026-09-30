@@ -1,7 +1,7 @@
 # cargo-auth
 
-`cargo-auth` is a Cargo external subcommand for keeping multiple crates.io
-credentials and selecting the active one.
+`cargo-auth` is a Cargo external subcommand for keeping multiple encrypted
+credential profiles for crates.io and alternate Cargo registries.
 
 ## Installation
 
@@ -25,8 +25,11 @@ cargo install --path .
 ```console
 cargo auth add personal
 cargo auth add work
+cargo auth add personal --registry de02
 cargo auth list
 cargo auth use personal
+cargo auth use personal --registry de02
+cargo auth current --all
 cargo auth current
 cargo auth logout
 ```
@@ -41,21 +44,40 @@ Tokens are encrypted by default with a key derived from an interactively
 entered master password. The password is never accepted as a command-line
 argument or stored on disk.
 
-Profiles are stored in Cargo's `credentials.toml` under
-`[cargo-auth.credentials]`. Running `cargo auth use NAME` decrypts the selected
-profile and writes its token to `[registry].token` for compatibility with
-Cargo. This means the active token is present as plaintext while it is active.
+Profiles are stored in Cargo's user-level `credentials.toml`. Each profile can
+hold a separate credential for crates.io and for any number of named alternate
+registries. Running `cargo auth use NAME` decrypts the crates.io credential and
+writes it to `[registry].token`. Running `cargo auth use NAME --registry REGISTRY`
+writes the selected alternate credential to `[registries.REGISTRY].token`.
+Active tokens are therefore present as plaintext while they are active.
+
+`cargo-auth` manages credentials only. It does not add, remove, or validate
+registry definitions and does not need to run inside a Cargo project. Named
+registries remain configured through Cargo, usually in `.cargo/config.toml`:
+
+```toml
+[registries.de02]
+index = "sparse+https://example.invalid/api/packages/developer/cargo/"
+```
+
+Registry names passed to `cargo-auth` must match the names used by Cargo.
+crates.io is selected when neither `--registry` nor `--all` is supplied.
 
 ## Commands
 
-- `add NAME [--plain]`
-- `remove NAME`
-- `list`
-- `encrypt NAME`
-- `decrypt NAME`
-- `use NAME`
-- `logout`
-- `current`
+- `add NAME [--registry REGISTRY] [--plain]`
+- `remove NAME [--registry REGISTRY | --all]`
+- `list [--registry REGISTRY | --all]`
+- `encrypt NAME [--registry REGISTRY | --all]`
+- `decrypt NAME [--registry REGISTRY | --all]`
+- `use NAME [--registry REGISTRY | --all]`
+- `logout [--registry REGISTRY | --all]`
+- `current [--registry REGISTRY | --all]`
+
+`--all` applies an operation to every applicable registry. For `use`, it
+activates only the credentials present in the selected profile; registries not
+present in that profile are left unchanged. `add` intentionally accepts only
+one registry because registry tokens are independent credentials.
 
 `--plain` and `decrypt` deliberately store a profile without encryption and
 print a warning when used.
@@ -64,8 +86,10 @@ Command names such as `add`, `remove`, `use`, `current`, and `logout` are
 reserved and cannot be used as profile names.
 
 `cargo auth logout` delegates to Cargo's native `cargo logout --registry
-crates-io` command to remove the active plaintext token, then clears the active
-profile marker. Encrypted profiles remain available for a later `use NAME`.
+crates-io` command to remove the active plaintext token, then clears that
+registry's active profile marker. `--registry REGISTRY` targets one alternate
+registry and `--all` logs out every registry currently managed as active by
+`cargo-auth`. Encrypted profiles remain available for later use.
 
 ## Verify the active credential
 

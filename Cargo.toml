@@ -3,10 +3,10 @@ name = "cargo-auth"
 version = "0.1.1"
 authors = ["iadev09"]
 edition = "2024"
-description = "A Cargo subcommand for securely managing and switching between multiple crates.io credentials"
+description = "A Cargo subcommand for securely managing and switching Cargo registry credentials"
 license = "MIT"
 repository = "https://github.com/iadev09/cargo-auth"
-keywords = ["cargo", "crates-io", "credentials", "authentication", "encryption"]
+keywords = ["cargo", "registry", "credentials", "authentication", "encryption"]
 categories = [
     "authentication",
     "command-line-utilities",

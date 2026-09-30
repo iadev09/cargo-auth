@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 const ENCRYPTED_PREFIX: &str = "enc:v1:";
 const PLAINTEXT_PREFIX: &str = "plain:";
+pub const DEFAULT_REGISTRY: &str = "crates-io";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const RESERVED_PROFILE_NAMES: &[&str] =
@@ -57,6 +58,7 @@ impl CredentialKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
+    pub registry: String,
     pub kind: CredentialKind,
     pub active: bool
 }
@@ -79,121 +81,227 @@ impl CredentialStore {
             }
         };
 
-        Ok(Self { path, document })
+        let mut store = Self { path, document };
+        store.migrate_legacy_format()?;
+        Ok(store)
     }
 
-    pub fn profiles(&self) -> Result<Vec<Profile>> {
-        let active = self.active_profile()?;
-        let Some(credentials) = self.credentials_table()? else {
+    pub fn profiles(
+        &self,
+        registry: Option<&str>
+    ) -> Result<Vec<Profile>> {
+        let Some(profiles) = self.profiles_table()? else {
             return Ok(Vec::new());
         };
 
-        let mut profiles = credentials
-            .iter()
-            .map(|(name, item)| {
-                let encoded =
-                    item.as_str().ok_or_else(|| anyhow!("credential {name:?} is not a string"))?;
-                let kind = credential_kind(encoded)
-                    .with_context(|| format!("credential {name:?} has an unsupported format"))?;
+        let mut result = Vec::new();
+        for (name, profile_item) in profiles {
+            let profile = profile_item
+                .as_table()
+                .ok_or_else(|| anyhow!("profile {name:?} must be a TOML table"))?;
+            let Some(credentials) = optional_table(profile, "credentials")? else {
+                continue;
+            };
+            for (registry_name, item) in credentials {
+                if registry.is_some_and(|selected| selected != registry_name) {
+                    continue;
+                }
+                let encoded = item.as_str().ok_or_else(|| {
+                    anyhow!("credential {name:?} for registry {registry_name:?} is not a string")
+                })?;
+                let kind = credential_kind(encoded).with_context(|| {
+                    format!(
+                        "credential {name:?} for registry {registry_name:?} has an unsupported format"
+                    )
+                })?;
+                result.push(Profile {
+                    name: name.to_owned(),
+                    registry: registry_name.to_owned(),
+                    kind,
+                    active: self.active_profile(registry_name)? == Some(name)
+                });
+            }
+        }
 
-                Ok(Profile { name: name.to_owned(), kind, active: active == Some(name) })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        profiles.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-        Ok(profiles)
+        result.sort_unstable_by(|left, right| {
+            left.registry.cmp(&right.registry).then_with(|| left.name.cmp(&right.name))
+        });
+        Ok(result)
     }
 
-    pub fn active_profile(&self) -> Result<Option<&str>> {
-        if self.registry_token()?.is_none() {
+    pub fn registries_for_profile(
+        &self,
+        name: &str
+    ) -> Result<Vec<String>> {
+        let mut registries: Vec<String> = self
+            .profile_table(name)?
+            .map(|profile| optional_table(profile, "credentials"))
+            .transpose()?
+            .flatten()
+            .map(|credentials| credentials.iter().map(|(name, _)| name.to_owned()).collect())
+            .unwrap_or_default();
+        registries.sort_unstable();
+        Ok(registries)
+    }
+
+    pub fn active_registries(&self) -> Result<Vec<String>> {
+        let mut registries: Vec<String> = self
+            .active_table()?
+            .map(|active| active.iter().map(|(name, _)| name.to_owned()).collect())
+            .unwrap_or_default();
+        registries.sort_unstable();
+        Ok(registries)
+    }
+
+    pub fn active_profiles(&self) -> Result<Vec<(String, String)>> {
+        let mut active = Vec::new();
+        for registry in self.active_registries()? {
+            if let Some(profile) = self.active_profile(&registry)? {
+                active.push((registry, profile.to_owned()));
+            }
+        }
+        Ok(active)
+    }
+
+    pub fn active_profile(
+        &self,
+        registry: &str
+    ) -> Result<Option<&str>> {
+        if self.registry_token(registry)?.is_none() {
             return Ok(None);
         }
 
-        self.stored_active_profile()
+        Ok(self.active_table()?.and_then(|table| table.get(registry)).and_then(Item::as_str))
     }
 
-    pub fn registry_token(&self) -> Result<Option<&str>> {
-        Ok(optional_table(self.document.as_table(), "registry")?
+    pub fn registry_token(
+        &self,
+        registry: &str
+    ) -> Result<Option<&str>> {
+        if registry == DEFAULT_REGISTRY {
+            return Ok(optional_table(self.document.as_table(), "registry")?
+                .and_then(|table| table.get("token"))
+                .and_then(Item::as_str));
+        }
+
+        Ok(optional_table(self.document.as_table(), "registries")?
+            .map(|registries| optional_table(registries, registry))
+            .transpose()?
+            .flatten()
             .and_then(|table| table.get("token"))
             .and_then(Item::as_str))
     }
 
-    pub fn has_profiles(&self) -> Result<bool> {
-        Ok(self.credentials_table()?.is_some_and(|table| !table.is_empty()))
+    pub fn has_profiles_for_registry(
+        &self,
+        registry: &str
+    ) -> Result<bool> {
+        Ok(!self.profiles(Some(registry))?.is_empty())
     }
 
     pub fn would_overwrite_unmanaged_token(
         &self,
+        registry: &str,
         token: &str
     ) -> Result<bool> {
-        if self.active_profile()?.is_some() {
+        if self.active_profile(registry)?.is_some() {
             return Ok(false);
         }
 
-        Ok(self.registry_token()?.is_some_and(|current| current != token))
+        Ok(self.registry_token(registry)?.is_some_and(|current| current != token))
     }
 
     pub fn contains(
         &self,
-        name: &str
+        name: &str,
+        registry: &str
     ) -> Result<bool> {
-        Ok(self.credentials_table()?.is_some_and(|credentials| credentials.contains_key(name)))
+        Ok(self
+            .profile_table(name)?
+            .map(|profile| optional_table(profile, "credentials"))
+            .transpose()?
+            .flatten()
+            .is_some_and(|credentials| credentials.contains_key(registry)))
     }
 
     pub fn insert(
         &mut self,
         name: &str,
+        registry: &str,
         encoded: String
     ) -> Result<()> {
         validate_profile_name(name)?;
+        validate_registry_name(registry)?;
         credential_kind(&encoded)?;
-        self.credentials_table_mut()?.insert(name, value(encoded));
+        table_mut(self.profile_table_mut(name)?, "credentials")?.insert(registry, value(encoded));
         Ok(())
     }
 
     pub fn remove(
         &mut self,
-        name: &str
+        name: &str,
+        registry: &str
     ) -> Result<bool> {
-        let removed = self.credentials_table_mut()?.remove(name).is_some();
+        if !self.contains(name, registry)? {
+            return Ok(false);
+        }
+        let removed = self
+            .profile_table_mut(name)?
+            .get_mut("credentials")
+            .and_then(Item::as_table_mut)
+            .is_some_and(|credentials| credentials.remove(registry).is_some());
 
-        if removed && self.stored_active_profile()? == Some(name) {
-            self.auth_table_mut()?.remove("active");
-            if let Some(registry) = optional_table_mut(self.document.as_table_mut(), "registry")? {
-                registry.remove("token");
-            }
+        if removed && self.stored_active_profile(registry)? == Some(name) {
+            self.clear_active_profile(registry)?;
+            self.remove_registry_token(registry)?;
         }
 
+        self.remove_empty_profile(name)?;
         Ok(removed)
     }
 
     pub fn encoded(
         &self,
-        name: &str
+        name: &str,
+        registry: &str
     ) -> Result<&str> {
-        self.credentials_table()?
-            .and_then(|credentials| credentials.get(name))
+        self.profile_table(name)?
+            .map(|profile| optional_table(profile, "credentials"))
+            .transpose()?
+            .flatten()
+            .and_then(|credentials| credentials.get(registry))
             .and_then(Item::as_str)
-            .ok_or_else(|| anyhow!("profile {name:?} does not exist"))
+            .ok_or_else(|| anyhow!("profile {name:?} has no credential for registry {registry:?}"))
     }
 
     pub fn activate(
         &mut self,
         name: &str,
+        registry: &str,
         token: &str
     ) -> Result<()> {
-        if !self.contains(name)? {
-            bail!("profile {name:?} does not exist");
+        if !self.contains(name, registry)? {
+            bail!("profile {name:?} has no credential for registry {registry:?}");
         }
 
-        table_mut(self.document.as_table_mut(), "registry")?.insert("token", value(token));
-        self.auth_table_mut()?.insert("active", value(name));
+        self.registry_table_mut(registry)?.insert("token", value(token));
+        self.active_table_mut()?.insert(registry, value(name));
         Ok(())
     }
 
-    pub fn clear_active_profile(&mut self) -> Result<bool> {
-        Ok(optional_table_mut(self.document.as_table_mut(), "cargo-auth")?
-            .is_some_and(|auth| auth.remove("active").is_some()))
+    pub fn clear_active_profile(
+        &mut self,
+        registry: &str
+    ) -> Result<bool> {
+        Ok(optional_table_mut(self.auth_table_mut()?, "active")?
+            .is_some_and(|active| active.remove(registry).is_some()))
+    }
+
+    pub fn remove_registry_token(
+        &mut self,
+        registry: &str
+    ) -> Result<bool> {
+        Ok(self.registry_table_mut(registry)?.remove("token").is_some())
     }
 
     pub fn save(&self) -> Result<()> {
@@ -217,27 +325,123 @@ impl CredentialStore {
         Ok(())
     }
 
-    fn auth_table(&self) -> Result<Option<&Table>> {
-        optional_table(self.document.as_table(), "cargo-auth")
+    fn migrate_legacy_format(&mut self) -> Result<()> {
+        let legacy_active = match self.auth_table_mut()?.get("active") {
+            Some(item) if item.is_str() => self
+                .auth_table_mut()?
+                .remove("active")
+                .and_then(|item| item.as_str().map(str::to_owned)),
+            Some(item) if item.is_table() => None,
+            Some(_) => bail!("cargo-auth active profiles must be a string or TOML table"),
+            None => None
+        };
+        if let Some(name) = legacy_active {
+            let active = self.active_table_mut()?;
+            if !active.contains_key(DEFAULT_REGISTRY) {
+                active.insert(DEFAULT_REGISTRY, value(name));
+            }
+        }
+
+        let legacy_credentials = self
+            .auth_table_mut()?
+            .remove("credentials")
+            .map(|item| {
+                item.into_table()
+                    .map_err(|_| anyhow!("legacy cargo-auth credentials must be a TOML table"))
+            })
+            .transpose()?;
+        if let Some(credentials) = legacy_credentials {
+            for (name, item) in credentials {
+                let target = table_mut(self.profile_table_mut(&name)?, "credentials")?;
+                if !target.contains_key(DEFAULT_REGISTRY) {
+                    target.insert(DEFAULT_REGISTRY, item);
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    fn stored_active_profile(&self) -> Result<Option<&str>> {
-        Ok(self.auth_table()?.and_then(|table| table.get("active")).and_then(Item::as_str))
+    fn auth_table(&self) -> Result<Option<&Table>> {
+        optional_table(self.document.as_table(), "cargo-auth")
     }
 
     fn auth_table_mut(&mut self) -> Result<&mut Table> {
         table_mut(self.document.as_table_mut(), "cargo-auth")
     }
 
-    fn credentials_table(&self) -> Result<Option<&Table>> {
+    fn active_table(&self) -> Result<Option<&Table>> {
         self.auth_table()?
-            .map(|auth| optional_table(auth, "credentials"))
+            .map(|auth| optional_table(auth, "active"))
             .transpose()
             .map(Option::flatten)
     }
 
-    fn credentials_table_mut(&mut self) -> Result<&mut Table> {
-        table_mut(self.auth_table_mut()?, "credentials")
+    fn active_table_mut(&mut self) -> Result<&mut Table> {
+        table_mut(self.auth_table_mut()?, "active")
+    }
+
+    fn profiles_table(&self) -> Result<Option<&Table>> {
+        self.auth_table()?
+            .map(|auth| optional_table(auth, "profiles"))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn profiles_table_mut(&mut self) -> Result<&mut Table> {
+        table_mut(self.auth_table_mut()?, "profiles")
+    }
+
+    fn profile_table(
+        &self,
+        name: &str
+    ) -> Result<Option<&Table>> {
+        self.profiles_table()?
+            .and_then(|profiles| profiles.get(name))
+            .map(|item| {
+                item.as_table().ok_or_else(|| anyhow!("profile {name:?} must be a TOML table"))
+            })
+            .transpose()
+    }
+
+    fn profile_table_mut(
+        &mut self,
+        name: &str
+    ) -> Result<&mut Table> {
+        table_mut(self.profiles_table_mut()?, name)
+    }
+
+    fn registry_table_mut(
+        &mut self,
+        registry: &str
+    ) -> Result<&mut Table> {
+        if registry == DEFAULT_REGISTRY {
+            return table_mut(self.document.as_table_mut(), "registry");
+        }
+        table_mut(table_mut(self.document.as_table_mut(), "registries")?, registry)
+    }
+
+    fn stored_active_profile(
+        &self,
+        registry: &str
+    ) -> Result<Option<&str>> {
+        Ok(self.active_table()?.and_then(|active| active.get(registry)).and_then(Item::as_str))
+    }
+
+    fn remove_empty_profile(
+        &mut self,
+        name: &str
+    ) -> Result<()> {
+        let empty = self
+            .profile_table(name)?
+            .map(|profile| optional_table(profile, "credentials"))
+            .transpose()?
+            .flatten()
+            .is_none_or(Table::is_empty);
+        if empty {
+            self.profiles_table_mut()?.remove(name);
+        }
+        Ok(())
     }
 }
 
@@ -347,6 +551,16 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_registry_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("registry name cannot be empty");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("registry name cannot contain control characters");
+    }
+    Ok(())
+}
+
 fn optional_table<'a>(
     parent: &'a Table,
     name: &str
@@ -422,15 +636,15 @@ mod tests {
         fs::write(&path, "[registries.private]\ntoken = \"existing-token\"\n").unwrap();
 
         let mut store = CredentialStore::load(&path).unwrap();
-        store.insert("personal", plaintext_credential("new-token")).unwrap();
-        store.activate("personal", "new-token").unwrap();
+        store.insert("personal", DEFAULT_REGISTRY, plaintext_credential("new-token")).unwrap();
+        store.activate("personal", DEFAULT_REGISTRY, "new-token").unwrap();
         store.save().unwrap();
 
         let saved = fs::read_to_string(path).unwrap();
         let document = saved.parse::<DocumentMut>().unwrap();
         assert_eq!(document["registries"]["private"]["token"].as_str(), Some("existing-token"));
         assert_eq!(document["registry"]["token"].as_str(), Some("new-token"));
-        assert_eq!(document["cargo-auth"]["active"].as_str(), Some("personal"));
+        assert_eq!(document["cargo-auth"]["active"][DEFAULT_REGISTRY].as_str(), Some("personal"));
     }
 
     #[test]
@@ -441,8 +655,8 @@ mod tests {
 
         let store = CredentialStore::load(path).unwrap();
 
-        assert!(!store.has_profiles().unwrap());
-        assert_eq!(store.registry_token().unwrap(), Some("existing-token"));
+        assert!(!store.has_profiles_for_registry(DEFAULT_REGISTRY).unwrap());
+        assert_eq!(store.registry_token(DEFAULT_REGISTRY).unwrap(), Some("existing-token"));
     }
 
     #[test]
@@ -451,9 +665,9 @@ mod tests {
         let path = temporary.path().join("credentials.toml");
         fs::write(&path, "[registry]\ntoken = \"existing-token\"\n").unwrap();
         let mut store = CredentialStore::load(path).unwrap();
-        store.insert("work", plaintext_credential("work-token")).unwrap();
+        store.insert("work", DEFAULT_REGISTRY, plaintext_credential("work-token")).unwrap();
 
-        assert!(store.has_profiles().unwrap());
+        assert!(store.has_profiles_for_registry(DEFAULT_REGISTRY).unwrap());
     }
 
     #[test]
@@ -463,8 +677,12 @@ mod tests {
         fs::write(&path, "[registry]\ntoken = \"existing-token\"\n").unwrap();
         let store = CredentialStore::load(path).unwrap();
 
-        assert!(!store.would_overwrite_unmanaged_token("existing-token").unwrap());
-        assert!(store.would_overwrite_unmanaged_token("different-token").unwrap());
+        assert!(
+            !store.would_overwrite_unmanaged_token(DEFAULT_REGISTRY, "existing-token").unwrap()
+        );
+        assert!(
+            store.would_overwrite_unmanaged_token(DEFAULT_REGISTRY, "different-token").unwrap()
+        );
     }
 
     #[test]
@@ -472,11 +690,11 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("credentials.toml");
         let mut store = CredentialStore::load(path).unwrap();
-        store.insert("work", plaintext_credential("work-token")).unwrap();
-        store.activate("work", "work-token").unwrap();
+        store.insert("work", DEFAULT_REGISTRY, plaintext_credential("work-token")).unwrap();
+        store.activate("work", DEFAULT_REGISTRY, "work-token").unwrap();
 
-        assert!(store.remove("work").unwrap());
-        assert_eq!(store.active_profile().unwrap(), None);
+        assert!(store.remove("work", DEFAULT_REGISTRY).unwrap());
+        assert_eq!(store.active_profile(DEFAULT_REGISTRY).unwrap(), None);
         assert!(store.document["registry"].get("token").is_none());
     }
 
@@ -485,27 +703,104 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let path = temporary.path().join("credentials.toml");
         let mut store = CredentialStore::load(path).unwrap();
-        store.insert("work", plaintext_credential("work-token")).unwrap();
-        store.activate("work", "work-token").unwrap();
+        store.insert("work", DEFAULT_REGISTRY, plaintext_credential("work-token")).unwrap();
+        store.activate("work", DEFAULT_REGISTRY, "work-token").unwrap();
 
-        assert!(store.clear_active_profile().unwrap());
+        assert!(store.clear_active_profile(DEFAULT_REGISTRY).unwrap());
 
-        assert_eq!(store.active_profile().unwrap(), None);
-        assert!(store.contains("work").unwrap());
+        assert_eq!(store.active_profile(DEFAULT_REGISTRY).unwrap(), None);
+        assert!(store.contains("work", DEFAULT_REGISTRY).unwrap());
     }
 
     #[test]
     fn profiles_are_sorted_and_mark_the_active_one() {
         let temporary = TempDir::new().unwrap();
         let mut store = CredentialStore::load(temporary.path().join("credentials.toml")).unwrap();
-        store.insert("work", plaintext_credential("work-token")).unwrap();
-        store.insert("personal", plaintext_credential("personal-token")).unwrap();
-        store.activate("work", "work-token").unwrap();
+        store.insert("work", DEFAULT_REGISTRY, plaintext_credential("work-token")).unwrap();
+        store.insert("personal", DEFAULT_REGISTRY, plaintext_credential("personal-token")).unwrap();
+        store.activate("work", DEFAULT_REGISTRY, "work-token").unwrap();
 
-        let profiles = store.profiles().unwrap();
+        let profiles = store.profiles(Some(DEFAULT_REGISTRY)).unwrap();
         assert_eq!(profiles[0].name, "personal");
         assert!(!profiles[0].active);
         assert_eq!(profiles[1].name, "work");
         assert!(profiles[1].active);
+    }
+
+    #[test]
+    fn one_profile_can_hold_independent_registry_credentials() {
+        let temporary = TempDir::new().unwrap();
+        let mut store = CredentialStore::load(temporary.path().join("credentials.toml")).unwrap();
+        store.insert("personal", DEFAULT_REGISTRY, plaintext_credential("crates-token")).unwrap();
+        store.insert("personal", "de02", plaintext_credential("de02-token")).unwrap();
+        store.activate("personal", DEFAULT_REGISTRY, "crates-token").unwrap();
+        store.activate("personal", "de02", "de02-token").unwrap();
+
+        assert_eq!(store.registries_for_profile("personal").unwrap(), vec!["crates-io", "de02"]);
+        assert_eq!(store.registry_token(DEFAULT_REGISTRY).unwrap(), Some("crates-token"));
+        assert_eq!(store.registry_token("de02").unwrap(), Some("de02-token"));
+        assert_eq!(store.active_profile(DEFAULT_REGISTRY).unwrap(), Some("personal"));
+        assert_eq!(store.active_profile("de02").unwrap(), Some("personal"));
+    }
+
+    #[test]
+    fn removing_one_registry_keeps_the_rest_of_the_profile() {
+        let temporary = TempDir::new().unwrap();
+        let mut store = CredentialStore::load(temporary.path().join("credentials.toml")).unwrap();
+        store.insert("personal", DEFAULT_REGISTRY, plaintext_credential("crates-token")).unwrap();
+        store.insert("personal", "de02", plaintext_credential("de02-token")).unwrap();
+
+        assert!(store.remove("personal", "de02").unwrap());
+        assert!(store.contains("personal", DEFAULT_REGISTRY).unwrap());
+        assert!(!store.contains("personal", "de02").unwrap());
+    }
+
+    #[test]
+    fn legacy_profiles_are_migrated_to_crates_io() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("credentials.toml");
+        fs::write(
+            &path,
+            "[registry]\ntoken = \"work-token\"\n\
+             [cargo-auth]\nactive = \"work\"\n\
+             [cargo-auth.credentials]\nwork = \"plain:work-token\"\n"
+        )
+        .unwrap();
+
+        let store = CredentialStore::load(path).unwrap();
+
+        assert_eq!(store.active_profile(DEFAULT_REGISTRY).unwrap(), Some("work"));
+        assert_eq!(store.encoded("work", DEFAULT_REGISTRY).unwrap(), "plain:work-token");
+        assert_eq!(store.registries_for_profile("work").unwrap(), vec!["crates-io"]);
+    }
+
+    #[test]
+    fn alternate_registry_activation_preserves_other_cargo_entries() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("credentials.toml");
+        fs::write(
+            &path,
+            "[registry]\ntoken = \"crates-token\"\n\
+             [registries.existing]\ntoken = \"existing-token\"\n"
+        )
+        .unwrap();
+        let mut store = CredentialStore::load(&path).unwrap();
+        store.insert("work", "de02", plaintext_credential("de02-token")).unwrap();
+        store.activate("work", "de02", "de02-token").unwrap();
+        store.save().unwrap();
+
+        let saved = fs::read_to_string(path).unwrap();
+        let document = saved.parse::<DocumentMut>().unwrap();
+        assert_eq!(document["registry"]["token"].as_str(), Some("crates-token"));
+        assert_eq!(document["registries"]["existing"]["token"].as_str(), Some("existing-token"));
+        assert_eq!(document["registries"]["de02"]["token"].as_str(), Some("de02-token"));
+    }
+
+    #[test]
+    fn registry_names_must_not_be_empty_or_contain_controls() {
+        assert!(validate_registry_name("").is_err());
+        assert!(validate_registry_name("de02\nother").is_err());
+        assert!(validate_registry_name("de02").is_ok());
+        assert!(validate_registry_name("company-registry").is_ok());
     }
 }

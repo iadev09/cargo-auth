@@ -4,10 +4,11 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, bail};
 use cargo_auth::{
-    CredentialKind, CredentialStore, credential_kind, credentials_path, decrypt_token,
-    encrypt_token, plaintext_credential, validate_profile_name
+    CredentialKind, CredentialStore, DEFAULT_REGISTRY, credential_kind, credentials_path,
+    decrypt_token, encrypt_token, plaintext_credential, validate_profile_name,
+    validate_registry_name
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use zeroize::Zeroizing;
 
 #[derive(Debug, Parser)]
@@ -15,45 +16,101 @@ use zeroize::Zeroizing;
     name = "cargo-auth",
     bin_name = "cargo auth",
     version,
-    about = "Manage multiple crates.io credentials"
+    about = "Manage multiple Cargo registry credentials"
 )]
 struct Options {
     #[command(subcommand)]
     command: Command
 }
 
+#[derive(Debug, Clone, Args)]
+struct RegistryArg {
+    /// Cargo registry name. Defaults to crates.io.
+    #[arg(long, default_value = DEFAULT_REGISTRY)]
+    registry: String
+}
+
+#[derive(Debug, Clone, Args)]
+struct RegistrySelection {
+    /// Select one Cargo registry. Defaults to crates.io.
+    #[arg(long, value_name = "NAME", conflicts_with = "all")]
+    registry: Option<String>,
+
+    /// Select every applicable registry.
+    #[arg(long, conflicts_with = "registry")]
+    all: bool
+}
+
+impl RegistrySelection {
+    fn registry(&self) -> &str {
+        self.registry.as_deref().unwrap_or(DEFAULT_REGISTRY)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Add or replace a credential profile.
+    /// Add or replace a credential for a profile and registry.
     Add {
         /// Profile name, such as "personal" or "work".
         name: String,
+
+        #[command(flatten)]
+        target: RegistryArg,
 
         /// Store the token as plaintext instead of encrypting it.
         #[arg(long)]
         plain: bool
     },
 
-    /// Remove a credential profile.
-    Remove { name: String },
+    /// Remove credentials from a profile.
+    Remove {
+        name: String,
+
+        #[command(flatten)]
+        target: RegistrySelection
+    },
 
     /// List saved credential profiles.
-    List,
+    List {
+        #[command(flatten)]
+        target: RegistrySelection
+    },
 
-    /// Encrypt a plaintext credential profile.
-    Encrypt { name: String },
+    /// Encrypt plaintext credentials in a profile.
+    Encrypt {
+        name: String,
 
-    /// Decrypt a profile and store it as plaintext.
-    Decrypt { name: String },
+        #[command(flatten)]
+        target: RegistrySelection
+    },
 
-    /// Make a profile the active crates.io credential.
-    Use { name: String },
+    /// Decrypt credentials in a profile and store them as plaintext.
+    Decrypt {
+        name: String,
 
-    /// Remove the active crates.io token using Cargo's native logout command.
-    Logout,
+        #[command(flatten)]
+        target: RegistrySelection
+    },
 
-    /// Show the active profile.
-    Current
+    /// Make a profile active for one or every registry it contains.
+    Use {
+        name: String,
+
+        #[command(flatten)]
+        target: RegistrySelection
+    },
+
+    /// Remove active registry tokens using Cargo's native logout command.
+    Logout {
+        #[command(flatten)]
+        target: RegistrySelection
+    },
+
+    /// Show active profiles by registry.
+    Current {
+        #[command(flatten)]
+        target: RegistrySelection
+    }
 }
 
 fn main() {
@@ -73,29 +130,27 @@ fn normalize_cargo_args(mut args: Vec<OsString>) -> Vec<OsString> {
 
 fn run(options: Options) -> Result<()> {
     let path = credentials_path()?;
-    if matches!(&options.command, Command::Logout) {
-        return cargo_logout(&path);
-    }
-
     let mut store = CredentialStore::load(&path)?;
 
     match options.command {
-        Command::Add { name, plain } => {
+        Command::Add { name, target, plain } => {
             validate_profile_name(&name)?;
-            let token = prompt_secret("Crates.io token: ")?;
+            validate_registry_name(&target.registry)?;
+            let registry = target.registry;
+            let token = prompt_secret(&format!("Token for registry {registry:?}: "))?;
             if token.is_empty() {
-                bail!("crates.io token cannot be empty");
+                bail!("token for registry {registry:?} cannot be empty");
             }
 
-            let first_profile = !store.has_profiles()?;
-            let existing_token = store.registry_token()?;
+            let first_profile = !store.has_profiles_for_registry(&registry)?;
+            let existing_token = store.registry_token(&registry)?;
             if first_profile
                 && existing_token.is_some_and(|existing_token| existing_token != token.as_str())
             {
                 bail!(
-                    "a different unmanaged Cargo token already exists in {}. Add that token as \
-                     the first profile, or remove `[registry].token` from that file before adding \
-                     a different token",
+                    "a different unmanaged Cargo token for registry {registry:?} already exists in \
+                     {}. Add that token as the first profile, or remove its token from that file \
+                     before adding a different token",
                     path.display()
                 );
             }
@@ -108,105 +163,222 @@ fn run(options: Options) -> Result<()> {
                 encrypt_token(token.as_bytes(), password.as_bytes())?
             };
 
-            let replaced = store.contains(&name)?;
-            let matches_registry_token = store.registry_token()? == Some(token.as_str());
-            let was_active = store.active_profile()? == Some(name.as_str());
-            store.insert(&name, encoded)?;
+            let replaced = store.contains(&name, &registry)?;
+            let matches_registry_token = store.registry_token(&registry)? == Some(token.as_str());
+            let was_active = store.active_profile(&registry)? == Some(name.as_str());
+            store.insert(&name, &registry, encoded)?;
             if was_active || matches_registry_token {
-                store.activate(&name, &token)?;
+                store.activate(&name, &registry, &token)?;
             }
             store.save()?;
-            if replaced {
-                println!("Replaced profile {name:?}.");
-            } else {
-                println!("Added profile {name:?}.");
-            }
+            let action = if replaced { "Replaced" } else { "Added" };
+            println!("{action} profile {name:?} for registry {registry:?}.");
         }
-        Command::Remove { name } => {
-            if !store.remove(&name)? {
-                bail!("profile {name:?} does not exist");
+        Command::Remove { name, target } => {
+            let registries = profile_targets(&store, &name, &target)?;
+            for registry in &registries {
+                if !store.remove(&name, registry)? {
+                    bail!("profile {name:?} has no credential for registry {registry:?}");
+                }
             }
             store.save()?;
-            println!("Removed profile {name:?}.");
+            print_registry_action("Removed", &name, &registries);
         }
-        Command::List => {
-            let profiles = store.profiles()?;
+        Command::List { target } => {
+            let registry = (!target.all).then(|| target.registry());
+            if let Some(registry) = registry {
+                validate_registry_name(registry)?;
+            }
+            let profiles = store.profiles(registry)?;
             if profiles.is_empty() {
-                println!("No credential profiles saved.");
+                if target.all {
+                    println!("No credential profiles saved.");
+                } else {
+                    println!("No credential profiles saved for registry {:?}.", target.registry());
+                }
             } else {
                 for profile in profiles {
                     let marker = if profile.active { "*" } else { " " };
-                    println!("{marker} {} ({})", profile.name, profile.kind.label());
+                    println!(
+                        "{marker} {} [{}] ({})",
+                        profile.name,
+                        profile.registry,
+                        profile.kind.label()
+                    );
                 }
             }
         }
-        Command::Encrypt { name } => {
-            let encoded = Zeroizing::new(store.encoded(&name)?.to_owned());
-            if credential_kind(&encoded)? == CredentialKind::Encrypted {
-                bail!("profile {name:?} is already encrypted");
+        Command::Encrypt { name, target } => {
+            let registries = profile_targets(&store, &name, &target)?;
+            let mut plaintext = Vec::new();
+            for registry in &registries {
+                let encoded = Zeroizing::new(store.encoded(&name, registry)?.to_owned());
+                if credential_kind(&encoded)? == CredentialKind::Plaintext {
+                    plaintext.push((registry.clone(), decrypt_token(&encoded, b"")?));
+                } else if !target.all {
+                    bail!("profile {name:?} is already encrypted for registry {registry:?}");
+                }
             }
-            let token = decrypt_token(&encoded, b"")?;
+            if plaintext.is_empty() {
+                bail!("profile {name:?} has no plaintext credentials");
+            }
             let password = prompt_new_password()?;
-            let encrypted = encrypt_token(&token, password.as_bytes())?;
-            store.insert(&name, encrypted)?;
-            store.save()?;
-            println!("Encrypted profile {name:?}.");
-        }
-        Command::Decrypt { name } => {
-            let encoded = Zeroizing::new(store.encoded(&name)?.to_owned());
-            if credential_kind(&encoded)? == CredentialKind::Plaintext {
-                bail!("profile {name:?} is already plaintext");
+            let encrypted = plaintext
+                .iter()
+                .map(|(registry, token)| {
+                    Ok((registry.clone(), encrypt_token(token, password.as_bytes())?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (registry, encoded) in encrypted {
+                store.insert(&name, &registry, encoded)?;
             }
-            let password = prompt_secret("Master password: ")?;
-            let token = decrypt_token(&encoded, password.as_bytes())?;
-            let token = std::str::from_utf8(&token).context("credential is not valid UTF-8")?;
-            store.insert(&name, plaintext_credential(token))?;
             store.save()?;
-            eprintln!("warning: profile {name:?} is now stored as plaintext");
+            print_registry_action("Encrypted", &name, &registries);
         }
-        Command::Use { name } => {
-            let encoded = Zeroizing::new(store.encoded(&name)?.to_owned());
-            let token = match credential_kind(&encoded)? {
-                CredentialKind::Encrypted => {
-                    let password = prompt_secret("Master password: ")?;
-                    decrypt_token(&encoded, password.as_bytes())?
+        Command::Decrypt { name, target } => {
+            let registries = profile_targets(&store, &name, &target)?;
+            let mut plaintext = Vec::new();
+            for registry in &registries {
+                let encoded = Zeroizing::new(store.encoded(&name, registry)?.to_owned());
+                if credential_kind(&encoded)? == CredentialKind::Plaintext {
+                    if !target.all {
+                        bail!("profile {name:?} is already plaintext for registry {registry:?}");
+                    }
+                    continue;
                 }
-                CredentialKind::Plaintext => decrypt_token(&encoded, b"")?
-            };
-            let token = std::str::from_utf8(&token).context("credential is not valid UTF-8")?;
-            if store.would_overwrite_unmanaged_token(token)? {
-                bail!(
-                    "a different unmanaged Cargo token is active; save it with `cargo auth add \
-                     <name>` before switching profiles"
-                );
+                let password = prompt_secret(&format!(
+                    "Master password for profile {name:?}, registry {registry:?}: "
+                ))?;
+                let token = decrypt_token(&encoded, password.as_bytes())?;
+                std::str::from_utf8(&token).context("credential is not valid UTF-8")?;
+                plaintext.push((registry.clone(), token));
             }
-            store.activate(&name, token)?;
+            if plaintext.is_empty() {
+                bail!("profile {name:?} has no encrypted credentials");
+            }
+            for (registry, token) in &plaintext {
+                let token = std::str::from_utf8(token).context("credential is not valid UTF-8")?;
+                store.insert(&name, registry, plaintext_credential(token))?;
+            }
             store.save()?;
-            println!("Using profile {name:?}.");
+            eprintln!(
+                "warning: selected credentials in profile {name:?} are now stored as plaintext"
+            );
         }
-        Command::Logout => unreachable!("logout is handled before loading credentials"),
-        Command::Current => match store.active_profile()? {
-            Some(name) => println!("{name}"),
-            None => println!("No active profile.")
+        Command::Use { name, target } => {
+            let registries = profile_targets(&store, &name, &target)?;
+            let mut tokens = Vec::new();
+            for registry in &registries {
+                let encoded = Zeroizing::new(store.encoded(&name, registry)?.to_owned());
+                let token = match credential_kind(&encoded)? {
+                    CredentialKind::Encrypted => {
+                        let password = prompt_secret(&format!(
+                            "Master password for profile {name:?}, registry {registry:?}: "
+                        ))?;
+                        decrypt_token(&encoded, password.as_bytes())?
+                    }
+                    CredentialKind::Plaintext => decrypt_token(&encoded, b"")?
+                };
+                let token_str =
+                    std::str::from_utf8(&token).context("credential is not valid UTF-8")?;
+                if store.would_overwrite_unmanaged_token(registry, token_str)? {
+                    bail!(
+                        "a different unmanaged Cargo token is active for registry {registry:?}; \
+                         save it with `cargo auth add <name> --registry {registry}` before \
+                         switching profiles"
+                    );
+                }
+                tokens.push((registry.clone(), token));
+            }
+            for (registry, token) in &tokens {
+                let token = std::str::from_utf8(token).context("credential is not valid UTF-8")?;
+                store.activate(&name, registry, token)?;
+            }
+            store.save()?;
+            print_registry_action("Using", &name, &registries);
+        }
+        Command::Logout { target } => {
+            let registries = if target.all {
+                store.active_registries()?
+            } else {
+                validate_registry_name(target.registry())?;
+                vec![target.registry().to_owned()]
+            };
+            if registries.is_empty() {
+                println!("No active profiles.");
+                return Ok(());
+            }
+            drop(store);
+            for registry in &registries {
+                cargo_logout(registry)?;
+                let mut current = CredentialStore::load(&path)?;
+                if current.clear_active_profile(registry)? {
+                    current.save()?;
+                }
+            }
+        }
+        Command::Current { target } => {
+            if target.all {
+                let active = store.active_profiles()?;
+                if active.is_empty() {
+                    println!("No active profiles.");
+                } else {
+                    for (registry, name) in active {
+                        println!("{registry}\t{name}");
+                    }
+                }
+            } else {
+                let registry = target.registry();
+                validate_registry_name(registry)?;
+                match store.active_profile(registry)? {
+                    Some(name) => println!("{name}"),
+                    None => println!("No active profile for registry {registry:?}.")
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-fn cargo_logout(path: &std::path::Path) -> Result<()> {
+fn profile_targets(
+    store: &CredentialStore,
+    name: &str,
+    target: &RegistrySelection
+) -> Result<Vec<String>> {
+    validate_profile_name(name)?;
+    if target.all {
+        let registries = store.registries_for_profile(name)?;
+        if registries.is_empty() {
+            bail!("profile {name:?} does not exist");
+        }
+        Ok(registries)
+    } else {
+        validate_registry_name(target.registry())?;
+        Ok(vec![target.registry().to_owned()])
+    }
+}
+
+fn print_registry_action(
+    action: &str,
+    name: &str,
+    registries: &[String]
+) {
+    if registries.len() == 1 {
+        println!("{action} profile {name:?} for registry {:?}.", registries[0]);
+    } else {
+        println!("{action} profile {name:?} for registries {}.", registries.join(", "));
+    }
+}
+
+fn cargo_logout(registry: &str) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     let status = ProcessCommand::new(cargo)
-        .args(["logout", "--registry", "crates-io"])
+        .args(["logout", "--registry", registry])
         .status()
-        .context("failed to run Cargo's logout command")?;
+        .with_context(|| format!("failed to run Cargo logout for registry {registry:?}"))?;
     if !status.success() {
-        bail!("Cargo logout failed with {status}");
-    }
-
-    let mut store = CredentialStore::load(path)?;
-    if store.clear_active_profile()? {
-        store.save()?;
+        bail!("Cargo logout for registry {registry:?} failed with {status}");
     }
     Ok(())
 }
@@ -240,7 +412,7 @@ mod tests {
         let args = ["cargo-auth", "auth", "list"].into_iter().map(OsString::from).collect();
 
         let options = Options::try_parse_from(normalize_cargo_args(args)).unwrap();
-        assert!(matches!(options.command, Command::List));
+        assert!(matches!(options.command, Command::List { .. }));
     }
 
     #[test]
@@ -248,14 +420,53 @@ mod tests {
         let args = ["cargo-auth", "list"].into_iter().map(OsString::from).collect();
 
         let options = Options::try_parse_from(normalize_cargo_args(args)).unwrap();
-        assert!(matches!(options.command, Command::List));
+        assert!(matches!(options.command, Command::List { .. }));
     }
 
     #[test]
-    fn accepts_logout_command() {
-        let args = ["cargo-auth", "logout"].into_iter().map(OsString::from).collect();
+    fn registry_defaults_to_crates_io() {
+        let options = Options::try_parse_from(["cargo-auth", "use", "personal"]).unwrap();
+        let Command::Use { target, .. } = options.command else {
+            panic!("expected use command");
+        };
+        assert_eq!(target.registry(), DEFAULT_REGISTRY);
+        assert!(!target.all);
+    }
 
-        let options = Options::try_parse_from(normalize_cargo_args(args)).unwrap();
-        assert!(matches!(options.command, Command::Logout));
+    #[test]
+    fn accepts_registry_and_all_selectors() {
+        let options =
+            Options::try_parse_from(["cargo-auth", "use", "personal", "--registry", "de02"])
+                .unwrap();
+        let Command::Use { target, .. } = options.command else {
+            panic!("expected use command");
+        };
+        assert_eq!(target.registry(), "de02");
+
+        let options = Options::try_parse_from(["cargo-auth", "current", "--all"]).unwrap();
+        let Command::Current { target } = options.command else {
+            panic!("expected current command");
+        };
+        assert!(target.all);
+    }
+
+    #[test]
+    fn registry_and_all_are_mutually_exclusive() {
+        assert!(
+            Options::try_parse_from([
+                "cargo-auth",
+                "use",
+                "personal",
+                "--registry",
+                "de02",
+                "--all"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn add_does_not_accept_all() {
+        assert!(Options::try_parse_from(["cargo-auth", "add", "personal", "--all"]).is_err());
     }
 }
