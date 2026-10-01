@@ -137,7 +137,7 @@ fn run(options: Options) -> Result<()> {
             validate_profile_name(&name)?;
             validate_registry_name(&target.registry)?;
             let registry = target.registry;
-            let token = prompt_secret(&format!("Token for registry {registry:?}: "))?;
+            let token = prompt_secret(&credential_prompt(&registry))?;
             if token.is_empty() {
                 bail!("token for registry {registry:?} cannot be empty");
             }
@@ -149,8 +149,8 @@ fn run(options: Options) -> Result<()> {
             {
                 bail!(
                     "a different unmanaged Cargo token for registry {registry:?} already exists in \
-                     {}. Add that token as the first profile, or remove its token from that file \
-                     before adding a different token",
+                     {}. Add the existing token as the first profile to preserve it before adding \
+                     a different token",
                     path.display()
                 );
             }
@@ -267,6 +267,13 @@ fn run(options: Options) -> Result<()> {
         }
         Command::Use { name, target } => {
             let registries = profile_targets(&store, &name, &target)?;
+            if target.all && registries.len() == 1 {
+                eprintln!(
+                    "warning: --all was requested, but profile {name:?} only has a credential for \
+                     registry {:?}",
+                    registries[0]
+                );
+            }
             let mut tokens = Vec::new();
             for registry in &registries {
                 let encoded = Zeroizing::new(store.encoded(&name, registry)?.to_owned());
@@ -319,11 +326,12 @@ fn run(options: Options) -> Result<()> {
         }
         Command::Current { target } => {
             if target.all {
-                let active = store.active_profiles()?;
-                if active.is_empty() {
+                let registries = store.token_registries()?;
+                if registries.is_empty() {
                     println!("No active profiles.");
                 } else {
-                    for (registry, name) in active {
+                    for registry in registries {
+                        let name = store.active_profile(&registry)?.unwrap_or("<unmanaged>");
                         println!("{registry}\t{name}");
                     }
                 }
@@ -332,6 +340,7 @@ fn run(options: Options) -> Result<()> {
                 validate_registry_name(registry)?;
                 match store.active_profile(registry)? {
                     Some(name) => println!("{name}"),
+                    None if store.registry_token(registry)?.is_some() => println!("<unmanaged>"),
                     None => println!("No active profile for registry {registry:?}.")
                 }
             }
@@ -395,12 +404,26 @@ fn prompt_new_password() -> Result<Zeroizing<String>> {
     Ok(password)
 }
 
+fn credential_prompt(registry: &str) -> String {
+    if registry == DEFAULT_REGISTRY {
+        return format!("Token for registry {registry:?}: ");
+    }
+
+    format!(
+        "Authorization value for registry {registry:?} (include an auth scheme such as Bearer if \
+         required): "
+    )
+}
+
 fn prompt_secret(prompt: &str) -> Result<Zeroizing<String>> {
     if !io::stdin().is_terminal() {
         bail!("interactive terminal input is required");
     }
     io::stderr().flush().context("failed to flush prompt")?;
-    rpassword::prompt_password(prompt).map(Zeroizing::new).context("failed to read hidden input")
+    let config = rpassword::ConfigBuilder::new().password_feedback_mask('*').build();
+    rpassword::prompt_password_with_config(prompt, config)
+        .map(Zeroizing::new)
+        .context("failed to read hidden input")
 }
 
 #[cfg(test)]
@@ -436,12 +459,12 @@ mod tests {
     #[test]
     fn accepts_registry_and_all_selectors() {
         let options =
-            Options::try_parse_from(["cargo-auth", "use", "personal", "--registry", "de02"])
+            Options::try_parse_from(["cargo-auth", "use", "personal", "--registry", "private"])
                 .unwrap();
         let Command::Use { target, .. } = options.command else {
             panic!("expected use command");
         };
-        assert_eq!(target.registry(), "de02");
+        assert_eq!(target.registry(), "private");
 
         let options = Options::try_parse_from(["cargo-auth", "current", "--all"]).unwrap();
         let Command::Current { target } = options.command else {
@@ -458,7 +481,7 @@ mod tests {
                 "use",
                 "personal",
                 "--registry",
-                "de02",
+                "private",
                 "--all"
             ])
             .is_err()
@@ -468,5 +491,20 @@ mod tests {
     #[test]
     fn add_does_not_accept_all() {
         assert!(Options::try_parse_from(["cargo-auth", "add", "personal", "--all"]).is_err());
+    }
+
+    #[test]
+    fn check_is_not_a_command() {
+        assert!(Options::try_parse_from(["cargo-auth", "check"]).is_err());
+    }
+
+    #[test]
+    fn alternate_registry_prompt_explains_authorization_schemes() {
+        assert_eq!(credential_prompt(DEFAULT_REGISTRY), "Token for registry \"crates-io\": ");
+        assert_eq!(
+            credential_prompt("private"),
+            "Authorization value for registry \"private\" (include an auth scheme such as Bearer if \
+             required): "
+        );
     }
 }

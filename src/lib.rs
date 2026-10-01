@@ -153,6 +153,25 @@ impl CredentialStore {
         Ok(registries)
     }
 
+    pub fn token_registries(&self) -> Result<Vec<String>> {
+        let mut registries = Vec::new();
+        if self.registry_token(DEFAULT_REGISTRY)?.is_some() {
+            registries.push(DEFAULT_REGISTRY.to_owned());
+        }
+        if let Some(alternates) = optional_table(self.document.as_table(), "registries")? {
+            for (name, item) in alternates {
+                let table = item
+                    .as_table()
+                    .ok_or_else(|| anyhow!("registry {name:?} must be a TOML table"))?;
+                if table.get("token").and_then(Item::as_str).is_some() {
+                    registries.push(name.to_owned());
+                }
+            }
+        }
+        registries.sort_unstable();
+        Ok(registries)
+    }
+
     pub fn active_profiles(&self) -> Result<Vec<(String, String)>> {
         let mut active = Vec::new();
         for registry in self.active_registries()? {
@@ -626,6 +645,7 @@ mod tests {
             assert!(error.to_string().contains("is reserved"));
         }
         assert!(validate_profile_name("CURRENT").is_err());
+        assert!(validate_profile_name("check").is_ok());
         assert!(validate_profile_name("personal").is_ok());
     }
 
@@ -732,15 +752,15 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let mut store = CredentialStore::load(temporary.path().join("credentials.toml")).unwrap();
         store.insert("personal", DEFAULT_REGISTRY, plaintext_credential("crates-token")).unwrap();
-        store.insert("personal", "de02", plaintext_credential("de02-token")).unwrap();
+        store.insert("personal", "private", plaintext_credential("private-token")).unwrap();
         store.activate("personal", DEFAULT_REGISTRY, "crates-token").unwrap();
-        store.activate("personal", "de02", "de02-token").unwrap();
+        store.activate("personal", "private", "private-token").unwrap();
 
-        assert_eq!(store.registries_for_profile("personal").unwrap(), vec!["crates-io", "de02"]);
+        assert_eq!(store.registries_for_profile("personal").unwrap(), vec!["crates-io", "private"]);
         assert_eq!(store.registry_token(DEFAULT_REGISTRY).unwrap(), Some("crates-token"));
-        assert_eq!(store.registry_token("de02").unwrap(), Some("de02-token"));
+        assert_eq!(store.registry_token("private").unwrap(), Some("private-token"));
         assert_eq!(store.active_profile(DEFAULT_REGISTRY).unwrap(), Some("personal"));
-        assert_eq!(store.active_profile("de02").unwrap(), Some("personal"));
+        assert_eq!(store.active_profile("private").unwrap(), Some("personal"));
     }
 
     #[test]
@@ -748,11 +768,11 @@ mod tests {
         let temporary = TempDir::new().unwrap();
         let mut store = CredentialStore::load(temporary.path().join("credentials.toml")).unwrap();
         store.insert("personal", DEFAULT_REGISTRY, plaintext_credential("crates-token")).unwrap();
-        store.insert("personal", "de02", plaintext_credential("de02-token")).unwrap();
+        store.insert("personal", "private", plaintext_credential("private-token")).unwrap();
 
-        assert!(store.remove("personal", "de02").unwrap());
+        assert!(store.remove("personal", "private").unwrap());
         assert!(store.contains("personal", DEFAULT_REGISTRY).unwrap());
-        assert!(!store.contains("personal", "de02").unwrap());
+        assert!(!store.contains("personal", "private").unwrap());
     }
 
     #[test]
@@ -785,22 +805,39 @@ mod tests {
         )
         .unwrap();
         let mut store = CredentialStore::load(&path).unwrap();
-        store.insert("work", "de02", plaintext_credential("de02-token")).unwrap();
-        store.activate("work", "de02", "de02-token").unwrap();
+        store.insert("work", "private", plaintext_credential("private-token")).unwrap();
+        store.activate("work", "private", "private-token").unwrap();
         store.save().unwrap();
 
         let saved = fs::read_to_string(path).unwrap();
         let document = saved.parse::<DocumentMut>().unwrap();
         assert_eq!(document["registry"]["token"].as_str(), Some("crates-token"));
         assert_eq!(document["registries"]["existing"]["token"].as_str(), Some("existing-token"));
-        assert_eq!(document["registries"]["de02"]["token"].as_str(), Some("de02-token"));
+        assert_eq!(document["registries"]["private"]["token"].as_str(), Some("private-token"));
+    }
+
+    #[test]
+    fn token_registries_include_unmanaged_tokens() {
+        let temporary = TempDir::new().unwrap();
+        let path = temporary.path().join("credentials.toml");
+        fs::write(
+            &path,
+            "[registry]\ntoken = \"crates-token\"\n\
+             [registries.private]\ntoken = \"private-token\"\n"
+        )
+        .unwrap();
+
+        let store = CredentialStore::load(path).unwrap();
+
+        assert_eq!(store.token_registries().unwrap(), vec!["crates-io", "private"]);
+        assert_eq!(store.active_profile("private").unwrap(), None);
     }
 
     #[test]
     fn registry_names_must_not_be_empty_or_contain_controls() {
         assert!(validate_registry_name("").is_err());
-        assert!(validate_registry_name("de02\nother").is_err());
-        assert!(validate_registry_name("de02").is_ok());
+        assert!(validate_registry_name("private\nother").is_err());
+        assert!(validate_registry_name("private").is_ok());
         assert!(validate_registry_name("company-registry").is_ok());
     }
 }

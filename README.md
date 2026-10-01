@@ -14,21 +14,15 @@ cargo install cargo-auth
 Use `cargo install cargo-auth --locked` when you specifically want to install
 with the dependency versions pinned by the published package.
 
-Or install the current source checkout:
-
-```console
-cargo install --path .
-```
-
 ## Usage
 
 ```console
 cargo auth add personal
 cargo auth add work
-cargo auth add personal --registry de02
+cargo auth add personal --registry private
 cargo auth list
 cargo auth use personal
-cargo auth use personal --registry de02
+cargo auth use personal --registry private
 cargo auth current --all
 cargo auth current
 cargo auth logout
@@ -37,7 +31,7 @@ cargo auth logout
 When the first profile is added, `cargo-auth` checks whether its token matches
 Cargo's existing active `[registry].token`. A different unmanaged token is not
 overwritten: the command exits with the `credentials.toml` path and asks you to
-add the existing token first or remove it before adding a different one. A
+add the existing token as the first profile before adding a different one. A
 matching token is saved normally and marked active.
 
 Tokens are encrypted by default with a key derived from an interactively
@@ -56,12 +50,16 @@ registry definitions and does not need to run inside a Cargo project. Named
 registries remain configured through Cargo, usually in `.cargo/config.toml`:
 
 ```toml
-[registries.de02]
-index = "sparse+https://example.invalid/api/packages/developer/cargo/"
+[registries.private]
+index = "sparse+https://registry.example.com/index/"
 ```
 
 Registry names passed to `cargo-auth` must match the names used by Cargo.
 crates.io is selected when neither `--registry` nor `--all` is supplied.
+For alternate registries, enter the complete Authorization header value when
+prompted, including its authorization scheme when required. For example, Gitea
+expects `Bearer TOKEN`. `cargo-auth` stores the value exactly as entered and
+does not add or remove a scheme.
 
 ## Commands
 
@@ -76,8 +74,10 @@ crates.io is selected when neither `--registry` nor `--all` is supplied.
 
 `--all` applies an operation to every applicable registry. For `use`, it
 activates only the credentials present in the selected profile; registries not
-present in that profile are left unchanged. `add` intentionally accepts only
-one registry because registry tokens are independent credentials.
+present in that profile are left unchanged. When that profile contains only one
+registry credential, `use NAME --all` reports this explicitly. `add`
+intentionally accepts only one registry because registry tokens are independent
+credentials.
 
 `--plain` and `decrypt` deliberately store a profile without encryption and
 print a warning when used.
@@ -91,20 +91,10 @@ registry's active profile marker. `--registry REGISTRY` targets one alternate
 registry and `--all` logs out every registry currently managed as active by
 `cargo-auth`. Encrypted profiles remain available for later use.
 
-## Verify the active credential
-
-Cargo does not provide a native `whoami` command. To verify that the active
-token is accepted by crates.io, list the owners of a crate that the token can
-access:
-
-```console
-cargo auth use personal
-cargo owner --list <crate-you-own>
-```
-
-A successful response confirms that the token is valid for that operation. It
-lists every owner of the crate; it does not identify which owner the active
-token belongs to. The crate must already exist on crates.io.
+`current` also detects active Cargo tokens that were not activated by
+`cargo-auth`. Their registry is shown normally and their profile is reported as
+`<unmanaged>`; Cargo registry tokens do not contain a portable profile or user
+identity.
 
 ## License
 
