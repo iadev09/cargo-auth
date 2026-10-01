@@ -19,10 +19,10 @@ with the dependency versions pinned by the published package.
 ```console
 cargo auth add personal
 cargo auth add work
-cargo auth add personal --registry private
+cargo auth add personal -r private
 cargo auth list
 cargo auth use personal
-cargo auth use personal --registry private
+cargo auth use personal -r private
 cargo auth current --all
 cargo auth current
 cargo auth logout
@@ -78,6 +78,8 @@ present in that profile are left unchanged. When that profile contains only one
 registry credential, `use NAME --all` reports this explicitly. `add`
 intentionally accepts only one registry because registry tokens are independent
 credentials.
+
+`-r` is the short form of `--registry`; `-a` is the short form of `--all`.
 
 `--plain` and `decrypt` deliberately store a profile without encryption and
 print a warning when used.

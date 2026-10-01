@@ -1,6 +1,6 @@
 [package]
 name = "cargo-auth"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["iadev09"]
 edition = "2024"
 description = "A Cargo subcommand for securely managing and switching Cargo registry credentials"

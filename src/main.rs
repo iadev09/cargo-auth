@@ -26,18 +26,18 @@ struct Options {
 #[derive(Debug, Clone, Args)]
 struct RegistryArg {
     /// Cargo registry name. Defaults to crates.io.
-    #[arg(long, default_value = DEFAULT_REGISTRY)]
+    #[arg(short = 'r', long, default_value = DEFAULT_REGISTRY)]
     registry: String
 }
 
 #[derive(Debug, Clone, Args)]
 struct RegistrySelection {
     /// Select one Cargo registry. Defaults to crates.io.
-    #[arg(long, value_name = "NAME", conflicts_with = "all")]
+    #[arg(short = 'r', long, value_name = "NAME", conflicts_with = "all")]
     registry: Option<String>,
 
     /// Select every applicable registry.
-    #[arg(long, conflicts_with = "registry")]
+    #[arg(short = 'a', long, conflicts_with = "registry")]
     all: bool
 }
 
@@ -459,14 +459,13 @@ mod tests {
     #[test]
     fn accepts_registry_and_all_selectors() {
         let options =
-            Options::try_parse_from(["cargo-auth", "use", "personal", "--registry", "private"])
-                .unwrap();
+            Options::try_parse_from(["cargo-auth", "use", "personal", "-r", "private"]).unwrap();
         let Command::Use { target, .. } = options.command else {
             panic!("expected use command");
         };
         assert_eq!(target.registry(), "private");
 
-        let options = Options::try_parse_from(["cargo-auth", "current", "--all"]).unwrap();
+        let options = Options::try_parse_from(["cargo-auth", "current", "-a"]).unwrap();
         let Command::Current { target } = options.command else {
             panic!("expected current command");
         };
@@ -482,7 +481,7 @@ mod tests {
                 "personal",
                 "--registry",
                 "private",
-                "--all"
+                "-a"
             ])
             .is_err()
         );
@@ -491,6 +490,16 @@ mod tests {
     #[test]
     fn add_does_not_accept_all() {
         assert!(Options::try_parse_from(["cargo-auth", "add", "personal", "--all"]).is_err());
+    }
+
+    #[test]
+    fn add_accepts_registry_short_option() {
+        let options =
+            Options::try_parse_from(["cargo-auth", "add", "personal", "-r", "private"]).unwrap();
+        let Command::Add { target, .. } = options.command else {
+            panic!("expected add command");
+        };
+        assert_eq!(target.registry, "private");
     }
 
     #[test]
